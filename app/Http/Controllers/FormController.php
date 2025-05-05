@@ -6,6 +6,10 @@ use App\Models\Form;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Str;
 
 class FormController extends Controller
 {
@@ -13,40 +17,256 @@ class FormController extends Controller
     {
         return response()->json(Form::all());
     }
-
     public function store(Request $request)
+    {
+        // Valider les données de base
+        $validator = Validator::make($request->all(), [
+            'name' => [
+                'required',
+                'string',
+                'max:255',
+                'regex:/^[a-zA-Z0-9_\- ]+$/',
+                'not_regex:/[\/\\\\]/'
+            ],
+            'form_data' => 'required|array',
+            'form_data.*.name' => 'required|string',
+            'form_data.*.type' => 'required|string',
+            'description' => 'nullable|string',
+            'files.*' => 'file|max:10240' // 10MB max per file
+        ], [
+            'name.regex' => 'The name can only contain letters, numbers, spaces, hyphens and underscores',
+            'name.not_regex' => 'The name cannot contain slashes'
+        ]);
+    
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Validation error',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+    
+        // Sanitize et valider le nom de la table
+        $tableName = $this->sanitizeTableName($request->name);
+        if (!$tableName) {
+            return response()->json([
+                'message' => 'Invalid table name',
+                'errors' => ['name' => ['The name contains invalid characters']]
+            ], 422);
+        }
+    
+        // Vérifier si la table existe déjà
+        if (Schema::hasTable($tableName)) {
+            return response()->json([
+                'message' => 'Table already exists',
+                'errors' => ['name' => ['A table with this name already exists']]
+            ], 400);
+        }
+    
+      
+    
+        try {
+            // Traitement des fichiers
+            $filePaths = [];
+            if ($request->hasFile('files')) {
+                foreach ($request->file('files') as $file) {
+                    $path = $file->store('public/uploads');
+                    $filePaths[] = str_replace('public/', 'storage/', $path);
+                }
+            }
+    
+            // Créer le formulaire
+            $form = Form::create([
+                'name' => $request->name,
+                'description' => $request->description,
+                'form_data' => json_encode($request->form_data)
+            ]);
+    
+            // Créer la table dynamique
+            $this->createDynamicTable($tableName, $request->form_data);
+    
+            // Créer les tables pour les multiselect si nécessaire
+            $hasMultiselect = collect($request->form_data)->contains('type', 'multiselect');
+            if ($hasMultiselect) {
+                $this->createMultiSelectTables($tableName);
+            }
+    
+            DB::commit();
+    
+            return response()->json([
+                'message' => 'Form created successfully',
+                'data' => $form
+            ], 201);
+    
+        } catch (\Exception $e) {
+            DB::rollBack();
+            
+            // Supprimer les fichiers uploadés en cas d'erreur
+            if (!empty($filePaths)) {
+                foreach ($filePaths as $path) {
+                    $storagePath = str_replace('storage/', 'public/', $path);
+                    Storage::delete($storagePath);
+                }
+            }
+            
+            \Log::error('Form creation error: '.$e->getMessage());
+            \Log::error('Stack trace: '.$e->getTraceAsString());
+            
+            return response()->json([
+                'message' => 'Error creating form',
+                'error' => $e->getMessage(),
+                'trace' => config('app.debug') ? $e->getTrace() : null
+            ], 500);
+        }
+    }
+  public function update(Request $request, $id)
 {
-    $request->validate([
-        'name' => 'required|string|max:255',
+    \Log::info('Update Request Data:', $request->all());
+
+    $validator = Validator::make($request->all(), [
+        'name' => [
+            'required', 
+            'string', 
+            'max:255',
+            'regex:/^[a-zA-Z0-9_\- ]+$/',
+            'not_regex:/[\/\\\\]/'
+        ],
         'form_data' => 'required|array',
+        'form_data.*.name' => 'required|string',
+        'form_data.*.type' => 'required|string',
+    ], [
+        'name.regex' => 'The name can only contain letters, numbers, spaces, hyphens and underscores',
+        'name.not_regex' => 'The name cannot contain slashes'
     ]);
 
-    $tableName = strtolower(str_replace(' ', '_', $request->name));
-
-    if (Schema::hasTable($tableName)) {
-        return response()->json(['message' => 'Une table avec ce nom existe déjà'], 400);
+    if ($validator->fails()) {
+        return response()->json([
+            'message' => 'Validation error',
+            'errors' => $validator->errors()
+        ], 422);
     }
 
-    // Stockez simplement le formulaire
-    $form = Form::create([
-        'name' => $request->name,
-        'form_data' => json_encode($request->form_data),
+    $form = Form::findOrFail($id);
+    $oldTableName = $this->sanitizeTableName($form->name);
+    $newTableName = $this->sanitizeTableName($request->name);
+
+
+    try {
+        $form->update([
+            'name' => $request->name,
+            'form_data' => json_encode($request->form_data),
+            'description' => $request->description ?? null
+        ]);
+
+        if ($oldTableName !== $newTableName) {
+            Schema::rename($oldTableName, $newTableName);
+            Schema::rename($oldTableName.'_multiselect_options', $newTableName.'_multiselect_options');
+            Schema::rename($oldTableName.'_multiselect_values', $newTableName.'_multiselect_values');
+        }
+
+        $this->updateDynamicTableStructure($newTableName, $request->form_data);
+
+        DB::commit();
+
+        return response()->json([
+            'message' => 'Form updated successfully',
+            'data' => $form
+        ]);
+
+    } catch (\Exception $e) {
+        DB::rollBack();
+        \Log::error('Form update error: '.$e->getMessage());
+        return response()->json([
+            'message' => 'Error updating form',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+    
+public function handleFileUpload(Request $request)
+{
+    // Get the first file from the request
+    $file = $request->file($request->keys()[0] ?? 'file');
+    
+    if (!$file) {
+        return response()->json([
+            'success' => false,
+            'message' => 'No file was uploaded'
+        ], 422);
+    }
+
+    $validator = Validator::make(['file' => $file], [
+        'file' => 'required|file|max:10240', // 10MB max
     ]);
 
-    $this->createDynamicTable($tableName, $request->form_data);
+    if ($validator->fails()) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Validation error',
+            'errors' => $validator->errors()
+        ], 422);
+    }
 
-    return response()->json($form, 201);
-}    private function createDynamicTable(string $tableName, array $fields)
+    try {
+        $path = $file->store('public/uploads');
+        $publicPath = str_replace('public/', 'storage/', $path);
+
+        return response()->json([
+            'success' => true,
+            'filePath' => $publicPath,
+            'url' => asset($publicPath)
+        ]);
+    } catch (\Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Upload failed',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}    private function parseFormData($formData)
+    {
+        if (is_string($formData)) {
+            try {
+                $formData = json_decode($formData, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $e) {
+                return response()->json([
+                    'message' => 'Invalid JSON data',
+                    'errors' => ['form_data' => ['The form_data must be a valid JSON string']]
+                ], 422);
+            }
+        }
+
+        if (!is_array($formData)) {
+            return response()->json([
+                'message' => 'Invalid form data',
+                'errors' => ['form_data' => ['The form_data must be an array']]
+            ], 422);
+        }
+
+        return $formData;
+    }
+
+    private function sanitizeTableName(string $name): ?string
+    {
+        $name = Str::lower(Str::slug($name, '_'));
+        return preg_match('/^[a-z][a-z0-9_]*$/', $name) ? $name : null;
+    }
+
+    private function createDynamicTable(string $tableName, array $fields)
     {
         try {
-            Schema::create($tableName, function ($table) use ($fields) {
+            Schema::create($tableName, function ($table) use ($fields,$tableName) {
                 $table->increments('id')->unsigned();
                 
                 foreach ($fields as $field) {
-                    $columnName = strtolower(str_replace(' ', '_', $field['name']));
+                    if (!isset($field['name']) || !isset($field['type'])) {
+                        continue;
+                    }
+
+                    $columnName = $this->sanitizeColumnName($field['name']);
                     $type = $field['type'];
                     
-                    if ($type === 'multiselect') continue;
+                    if ($type === 'multiselect') 
+                       continue; // Gérer séparément
                     
                     $columnType = $this->mapFieldTypeToMySQL($type);
                     if ($columnType) {
@@ -58,19 +278,23 @@ class FormController extends Controller
                 $table->timestamps();
                 $table->engine = 'InnoDB';
             });
-    
-            // Création tables pour multiselect uniquement
+
             $this->createMultiSelectTables($tableName);
-            
+        
+
         } catch (\Exception $e) {
-            \Log::error('Erreur création table : '.$e->getMessage());
+            \Log::error('Table creation error: '.$e->getMessage());
             throw $e;
         }
+    }
+
+    private function sanitizeColumnName(string $name): string
+    {
+        return Str::lower(Str::slug($name, '_'));
     }
     
     private function createMultiSelectTables(string $tableName)
     {
-        // Table des options multiselect
         Schema::create($tableName.'_multiselect_options', function ($table) {
             $table->increments('id')->unsigned();
             $table->string('field_name', 255);
@@ -78,8 +302,7 @@ class FormController extends Controller
             $table->unique(['field_name', 'option_value']);
             $table->engine = 'InnoDB';
         });
-    
-        // Table pivot
+
         Schema::create($tableName.'_multiselect_values', function ($table) use ($tableName) {
             $table->integer('entry_id')->unsigned();
             $table->integer('option_id')->unsigned();
@@ -99,49 +322,89 @@ class FormController extends Controller
             $table->engine = 'InnoDB';
         });
     }
-
+    
+  
+    
+    private function mapFieldTypeToMySQL(string $fieldType): ?string
+    {
+        return match ($fieldType) {
+            'text', 'email', 'password', 'select', 'radio' => 'string',
+            'number' => 'integer',
+            'date' => 'date',
+            'textarea' => 'text',
+            'checkbox' => 'boolean',
+            'multiselect' => null,
+            'boolean' => 'boolean',
+            'file', 'image' => 'string',
+            'color' => 'string',
+            'range' => 'float',
+            'time' => 'time',
+            'datetime-local' => 'datetime',
+            default => 'string',
+        };
+    }
     public function getFormConfig($id)
     {
-        $form = Form::findOrFail($id);
-        $formData = json_decode($form->form_data, true);
+        try {
+            $form = Form::findOrFail($id);
+            $formData = json_decode($form->form_data, true);
+            
+            if (!is_array($formData)) {
+                throw new \Exception('Invalid form data format');
+            }
+
+            foreach ($formData as &$field) {
+                if (!isset($field['type'])) continue;
+
+                // Pour les champs avec options statiques
+                if (in_array($field['type'], ['select', 'radio', 'checkbox'])) {
+                    if (!empty($field['options'])) {
+                        $field['options'] = array_map(function($opt) {
+                            return is_array($opt) ? $opt : ['value' => $opt, 'label' => $opt];
+                        }, (array)$field['options']);
+                    }
+                }
         
-        foreach ($formData as &$field) {
-            // Pour les champs avec options statiques
-            if (in_array($field['type'], ['select', 'radio', 'checkbox'])) {
-                if (!empty($field['options'])) {
-                    // Convertir les options au format {value, label} si nécessaire
-                    $field['options'] = array_map(function($opt) {
-                        return is_array($opt) ? $opt : ['value' => $opt, 'label' => $opt];
-                    }, (array)$field['options']);
+                // Pour les champs dynamiques
+                if (!empty($field['dynamic']) && !empty($field['sourceTable'])) {
+                    if (!Schema::hasTable($field['sourceTable'])) {
+                        continue;
+                    }
+
+                    $options = DB::table($field['sourceTable'])
+                        ->select([
+                            $field['keyColumn'].' as value',
+                            $field['valueColumn'].' as label'
+                        ])
+                        ->when(!empty($field['whereClause']), function($query) use ($field) {
+                            $query->whereRaw($field['whereClause']);
+                        })
+                        ->get()
+                        ->toArray();
+                    
+                    $field['options'] = $options;
+                }
+                elseif ($field['type'] === 'multiselect') {
+                    $optionsTable = strtolower(str_replace(' ', '_', $form->name)).'_multiselect_options';
+                    
+                    if (Schema::hasTable($optionsTable)) {
+                        $options = DB::table($optionsTable)
+                            ->where('field_name', $field['name'])
+                            ->select('option_value as value', 'option_value as label')
+                            ->get()
+                            ->toArray();
+                        
+                        $field['options'] = $options;
+                    }
                 }
             }
-    
-            // Pour les champs dynamiques
-            if (!empty($field['dynamic']) && !empty($field['sourceTable'])) {
-                // Options dynamiques
-                $options = DB::table($field['sourceTable'])
-                    ->select([
-                        $field['keyColumn'].' as value',
-                        $field['valueColumn'].' as label'
-                    ])
-                    ->get()
-                    ->toArray();
-                
-                $field['options'] = $options;
-            }
-            elseif ($field['type'] === 'multiselect') {
-                // Options multiselect
-                $options = DB::table(strtolower(str_replace(' ', '_', $form->name)).'_multiselect_options')
-                    ->where('field_name', $field['name'])
-                    ->select('option_value as value', 'option_value as label')
-                    ->get()
-                    ->toArray();
-                
-                $field['options'] = $options;
-            }
+            
+            return response()->json($formData);
+            
+        } catch (\Exception $e) {
+            \Log::error('Error getting form config: '.$e->getMessage());
+            return response()->json(['message' => 'Error retrieving form configuration'], 500);
         }
-        
-        return response()->json($formData);
     }
       
 public function saveFieldOptions(Request $request, $formId)
@@ -192,103 +455,111 @@ public function saveFieldOptions(Request $request, $formId)
     return response()->json(['message' => 'Option ajoutée avec succès']);
 }
    
-private function mapFieldTypeToMySQL(string $fieldType): ?string
-{
-    return match ($fieldType) {
-        'text', 'email', 'password', 'select', 'radio' => 'string',
-        'number' => 'integer',
-        'date' => 'date',
-        'textarea' => 'text',
-        'checkbox' => 'string', // stocke la valeur directement
-        'multiselect' => null, // pas de colonne, géré via tables pivot
-        'boolean' => 'boolean',
-        default => null,
-    };
-}
+
     
     public function show($id)
     {
         $form = Form::findOrFail($id);
         return response()->json($form);
     }
-
-    public function update(Request $request, $id)
+  
+    private function parseFormDataForUpdate($formData)
     {
-        $request->validate([
-            'name' => 'required|string|max:255',
-            'form_data' => 'required|array',
-        ]);
-
-        $form = Form::findOrFail($id);
-        $oldTableName = strtolower(str_replace(' ', '_', $form->name));
-        $newTableName = strtolower(str_replace(' ', '_', $request->name));
-
-        if ($oldTableName !== $newTableName) {
-            DB::statement("ALTER TABLE $oldTableName RENAME TO $newTableName");
+        if (is_string($formData)) {
+            try {
+                $formData = json_decode($formData, true, 512, JSON_THROW_ON_ERROR);
+            } catch (\JsonException $e) {
+                return response()->json([
+                    'message' => 'Invalid JSON data',
+                    'errors' => ['form_data' => ['The form_data must be a valid JSON string']]
+                ], 422);
+            }
         }
-
-        $this->updateDynamicTable($newTableName, json_decode($form->form_data, true), $request->form_data);
-
-        $form->update([
-            'name' => $request->name,
-            'form_data' => json_encode($request->form_data),
-        ]);
-
-        return response()->json($form);
+    
+        if (!is_array($formData)) {
+            return response()->json([
+                'message' => 'Invalid form data',
+                'errors' => ['form_data' => ['The form_data must be an array']]
+            ], 422);
+        }
+    
+        return $formData;
     }
-
-    private function updateDynamicTable(string $tableName, array $oldFields, array $newFields)
+    private function updateDynamicTableStructure(string $tableName, array $fields)
     {
-        if (!Schema::hasTable($tableName)) {
-            throw new \Exception("Table {$tableName} does not exist.");
-        }
-
-        $existingColumns = array_column(DB::select("SHOW COLUMNS FROM $tableName"), 'Field');
-        $newColumns = array_map(fn($field) => strtolower(str_replace(' ', '_', $field['name'])), $newFields);
-
-        foreach ($newFields as $field) {
-            $columnName = strtolower(str_replace(' ', '_', $field['name']));
-            $columnType = $this->mapFieldTypeToMySQL($field['type']);
-
-            if (!in_array($columnName, $existingColumns) && $columnType) {
-                DB::statement("ALTER TABLE $tableName ADD $columnName $columnType");
+        $existingColumns = Schema::getColumnListing($tableName);
+        $columnsToKeep = ['id', 'created_at', 'updated_at']; // Colonnes système à toujours garder
+    
+        // Ajouter les nouvelles colonnes et mettre à jour les existantes
+        foreach ($fields as $field) {
+            if (!isset($field['name']) || !isset($field['type'])) {
+                continue;
             }
+    
+            $columnName = $this->sanitizeColumnName($field['name']);
+            $type = $field['type'];
+            $columnType = $this->mapFieldTypeToMySQL($type);
+    
+            if ($columnType && !in_array($columnName, $existingColumns)) {
+                Schema::table($tableName, function ($table) use ($columnName, $columnType) {
+                    $column = $table->{$columnType}($columnName)->nullable();
+                    if ($columnType === 'integer') $column->unsigned();
+                });
+            }
+    
+            $columnsToKeep[] = $columnName;
         }
-
+    
+        // Supprimer les colonnes qui ne sont plus dans le formulaire
         foreach ($existingColumns as $column) {
-            if ($column !== 'id' && !in_array($column, $newColumns)) {
-                DB::statement("ALTER TABLE $tableName DROP COLUMN $column");
+            if (!in_array($column, $columnsToKeep)) {
+                Schema::table($tableName, function ($table) use ($column) {
+                    $table->dropColumn($column);
+                });
             }
+        }
+    
+        // Gérer les tables multiselect si nécessaire
+        $hasMultiselect = array_filter($fields, fn($f) => $f['type'] === 'multiselect');
+        if (!empty($hasMultiselect)) {
+            $this->ensureMultiselectTablesExist($tableName);
+        }
+    }
+    
+    private function ensureMultiselectTablesExist(string $tableName)
+    {
+        if (!Schema::hasTable($tableName.'_multiselect_options')) {
+            $this->createMultiSelectTables($tableName);
         }
     }
 
     public function destroy($id)
     {
-        // Validation de l'ID
         if (!is_numeric($id) || $id <= 0) {
             return response()->json([
                 'success' => false,
-                'message' => 'ID de formulaire invalide'
+                'message' => 'Invalid form ID'
             ], 400);
         }
     
         $form = Form::find($id);
-        
-        // Vérifier si le formulaire existe
+    
         if (!$form) {
             return response()->json([
                 'success' => false,
-                'message' => 'Formulaire non trouvé'
+                'message' => 'Form not found'
             ], 404);
         }
     
-        $tableName = strtolower(str_replace(' ', '_', $form->name));
-        $multiSelectOptionsTable = $tableName.'_multiselect_options';
-        $multiSelectValuesTable = $tableName.'_multiselect_values';
-    
+        $tableName = $this->sanitizeTableName($form->name);
+        $multiSelectOptionsTable = $tableName . '_multiselect_options';
+        $multiSelectValuesTable = $tableName . '_multiselect_values';
     
         try {
-            // 1. Vérifier les dépendances
+            // Commencer la transaction
+            
+    
+            // 1. Vérifier les dépendances (optionnel, selon vos besoins)
             $databaseName = config('database.connections.mysql.database');
             $dependencies = DB::select("
                 SELECT TABLE_NAME as table_name 
@@ -297,17 +568,33 @@ private function mapFieldTypeToMySQL(string $fieldType): ?string
                     REFERENCED_TABLE_NAME = ? 
                     AND REFERENCED_TABLE_SCHEMA = ?
                     AND TABLE_NAME NOT LIKE ?
-            ", [$tableName, $databaseName, $tableName.'%']);
+            ", [$tableName, $databaseName, $tableName . '%']);
     
             if (!empty($dependencies)) {
+                DB::rollBack();
                 return response()->json([
                     'success' => false,
-                    'message' => 'Impossible de supprimer: tables externes dépendantes',
+                    'message' => 'Cannot delete: external tables depend on this form.',
                     'dependencies' => $dependencies
                 ], 422);
             }
     
-            // 2. Supprimer les tables dans le bon ordre
+            // 2. Supprimer les fichiers associés
+            $formData = json_decode($form->form_data, true);
+            if (is_array($formData)) {
+                foreach ($formData as $field) {
+                    if (isset($field['type'], $field['filePath']) && 
+                        in_array($field['type'], ['file', 'image']) && 
+                        !empty($field['filePath'])) {
+                        $path = str_replace('storage/', 'public/', $field['filePath']);
+                        if (Storage::exists($path)) {
+                            Storage::delete($path);
+                        }
+                    }
+                }
+            }
+    
+            // 3. Supprimer les tables liées dans le bon ordre
             if (Schema::hasTable($multiSelectValuesTable)) {
                 Schema::drop($multiSelectValuesTable);
             }
@@ -320,28 +607,44 @@ private function mapFieldTypeToMySQL(string $fieldType): ?string
                 Schema::drop($tableName);
             }
     
-            // 3. Supprimer le formulaire
+            // 4. Supprimer l'enregistrement du formulaire
             $form->delete();
     
+            // Valider la transaction
             DB::commit();
     
             return response()->json([
                 'success' => true,
-                'message' => 'Suppression réussie'
+                'message' => 'Form deleted successfully'
             ]);
     
         } catch (\Exception $e) {
-            DB::rollBack();
-            \Log::error("Erreur suppression formulaire {$id}: " . $e->getMessage());
-            
+            // Annuler la transaction en cas d'erreur
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+    
+            \Log::error("Error deleting form ID {$id}: " . $e->getMessage());
+            \Log::error("Stack trace: " . $e->getTraceAsString());
+    
             return response()->json([
                 'success' => false,
-                'message' => 'Erreur lors de la suppression',
-                'error' => $e->getMessage()
+                'message' => 'Error during deletion',
+                'error' => $e->getMessage(),
+                'trace' => config('app.debug') ? $e->getTrace() : null
             ], 500);
         }
     }
+    public function getFile($filename)
+{
+    $path = storage_path('app/public/uploads/' . $filename);
 
+    if (!File::exists($path)) {
+        abort(404);
+    }
+
+    return response()->file($path);
+}
    public function getFormData($id)
 {
     $form = Form::findOrFail($id);
@@ -369,39 +672,52 @@ private function mapFieldTypeToMySQL(string $fieldType): ?string
         'entries' => $entries
     ]);
 }
-    public function submitFormData(Request $request, $id)
+
+public function submitFormData(Request $request, $id)
 {
     $form = Form::findOrFail($id);
-    $tableName = strtolower(str_replace(' ', '_', $form->name));
+    $tableName = $this->sanitizeTableName($form->name);
+    $formData = json_decode($form->form_data, true);
     
+    if (!is_array($formData)) {
+        return response()->json(['message' => 'Invalid form data format'], 400);
+    }
+
     DB::beginTransaction();
 
     try {
-        $formFields = json_decode($form->form_data, true);
         $dataToInsert = [];
+        $filePaths = [];
 
-        foreach ($formFields as $field) {
-            $key = strtolower(str_replace(' ', '_', $field['name']));
-            $value = $request->input($field['name']);
-            $type = $field['type'];
+         foreach ($formData as $field) {
+            if (!isset($field['name'], $field['type'])) continue;
 
-              // Conversion des valeurs
-              if ($type === 'checkbox') {
-                // Pour les checkboxes simples (sans options)
-                if (empty($field['options'])) {
-                    $dataToInsert[$key] = $value ? 1 : 0;
-                } 
-                // Pour les checkboxes avec options (case à cocher multiple)
-                else {
-                    $dataToInsert[$key] = json_encode((array)$value);
+            $fieldName = $field['name'];
+            $fieldType = $field['type'];
+            $inputValue = $request->input($fieldName);
+
+            // Gestion des fichiers
+            if ($fieldType === 'file' || $fieldType === 'image') {
+                if ($request->hasFile($fieldName)) {
+                    $file = $request->file($fieldName);
+                    $path = $file->store('public/uploads');
+                    $publicPath = str_replace('public/', 'storage/', $path);
+                    $dataToInsert[$fieldName] = $publicPath;
+                    $filePaths[] = $path;
                 }
+                continue;
             }
-            elseif ($type === 'multiselect') {
-                continue; // Géré après
+            // Gestion des checkbox simples (pas avec options)
+            elseif ($fieldType === 'checkbox' && empty($field['options'])) {
+                $dataToInsert[$fieldName] = $inputValue ? 1 : 0;
             }
+            // Ignorer multiselect (sera traité après)
+            elseif ($fieldType === 'multiselect') {
+                continue;
+            }
+            // Gestion des autres champs
             else {
-                // Stockage direct pour select/radio/text/etc.
-                $dataToInsert[$key] = $value;
+                $dataToInsert[$fieldName] = $inputValue;
             }
         }
 
@@ -409,7 +725,7 @@ private function mapFieldTypeToMySQL(string $fieldType): ?string
         $entryId = DB::table($tableName)->insertGetId($dataToInsert);
 
         // Gestion multiselect
-        foreach ($formFields as $field) {
+        foreach ($formData as $field) {
             if ($field['type'] === 'multiselect') {
                 $key = $field['name'];
                 $values = (array)$request->input($key, []);
@@ -437,14 +753,28 @@ private function mapFieldTypeToMySQL(string $fieldType): ?string
         }
 
         DB::commit();
-        return response()->json(['message' => 'Données enregistrées']);
+
+        return response()->json([
+            'message' => 'Data saved successfully',
+            'entry_id' => $entryId
+        ], 201);
         
     } catch (\Exception $e) {
         DB::rollBack();
-        \Log::error('Erreur soumission : '.$e->getMessage());
-        return response()->json(['error' => $e->getMessage()], 500);
+        
+        // Supprimer les fichiers uploadés en cas d'erreur
+        foreach ($filePaths as $path) {
+            Storage::delete($path);
+        }
+        
+        \Log::error('Form submission error: '.$e->getMessage());
+        return response()->json([
+            'message' => 'Error saving data',
+            'error' => $e->getMessage()
+        ], 500);
     }
 }
+
 
 public function getTableFieldOptions(Request $request, $table)
 {
@@ -499,6 +829,27 @@ public function getTableFieldOptions(Request $request, $table)
             foreach ($formFields as $field) {
                 $key = $field['name'];
                 $type = $field['type'];
+                if ($type === 'file' || $type === 'image') {
+                    if ($request->hasFile($key)) {
+                        // Supprimer l'ancien fichier si existant
+                        $oldPath = DB::table($tableName)
+                            ->where('id', $entryId)
+                            ->value($key);
+                        
+                        if ($oldPath) {
+                            $storagePath = str_replace('storage/', 'public/', $oldPath);
+                            $filesToDelete[] = $storagePath;
+                        }
+    
+                        // Enregistrer le nouveau fichier
+                        $file = $request->file($key);
+                        $path = $file->store('public/uploads');
+                        $publicPath = str_replace('public/', 'storage/', $path);
+                        $dataToUpdate[$key] = $publicPath;
+                        $newFilePaths[] = $path;
+                    }
+                    continue;
+                }
                 
                 if ($type === 'multiselect') {
                     continue; // géré séparément
@@ -682,8 +1033,8 @@ public function getColumnValues($table, $column)
 public function getFieldOptions($formId, $fieldName)
 {
     $form = Form::findOrFail($formId);
-    $tableName = strtolower(str_replace(' ', '_', $form->name));
-    $optionsTableName = $tableName . '_options';
+    $tableName = strtolower(str_replace(' ', '_', $form->name)); 
+        $optionsTableName = $tableName . '_options';
 
     $options = DB::table($optionsTableName)
         ->where('field_name', $fieldName)

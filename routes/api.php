@@ -4,20 +4,23 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\FormController;
 
 Route::prefix('forms')->group(function () {
+    Route::put('/{id}', [FormController::class, 'update']);
+    Route::post('/upload', [FormController::class, 'handleFileUpload']);
+
+    Route::get('files/{filename}', [FormController::class, 'getFile']);
     Route::delete('/{formId}/entries/{entryId}/delete', action: [FormController::class, 'deleteFormData']);
     Route::get('/table', [FormController::class, 'getAvailableTables']);
     Route::get('/tables/{table}/fields', [FormController::class, 'getTableFields']);
     Route::get('/tables/{table}/options', [FormController::class, 'getTableFieldOptions']);
     Route::get('/get-column-values/{table}/{column}', [FormController::class, 'getColumnValues']);
     Route::post('/{formId}/field-options', [FormController::class, 'saveFieldOptions']);
-
    
 
     Route::get('/', [FormController::class, 'index']);
     Route::post('/', [FormController::class, 'store']);
 
     Route::get('/{id}', [FormController::class, 'show']);
-    Route::put('/{id}', [FormController::class, 'update']);
+
 
     Route::delete('/{id}', [FormController::class, 'destroy']);
     Route::get('/{id}/data', [FormController::class, 'getFormData']);
