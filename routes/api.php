@@ -3,36 +3,80 @@
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\FormController;
 use App\Http\Controllers\AuthController;
+use App\Http\Controllers\KeycloakController;
 
-Route::prefix('forms')->group(function () {
-    Route::get('/{id}/data', [FormController::class, 'getFormData']);
-    Route::get('/{id}', [FormController::class, 'show']);
-    Route::get('/table', [FormController::class, 'getAvailableTables']);
-    Route::post('/{formId}/upload', [FormController::class, 'upload']);
-    Route::get('/{name}', [FormController::class, 'getByName']);
-    Route::get('/{formId}/files/{filename}', [FormController::class, 'getFile'])->where('filename', '.*');
-    Route::put('/{id}', [FormController::class, 'update']);
-    Route::get('/{id}/metadata', [FormController::class, 'getFormMetadata']);
-    Route::get('/id-by-name/{name}', [FormController::class, 'getIdByName']);
-    Route::post('/upload', [FormController::class, 'handleFileUpload']);
-    Route::post('/{form}/upload', [FormController::class, 'uploadFile']);
-    Route::get('/files/{filename}', [FormController::class, 'getFiles']);
-    Route::delete('/{formId}/entries/{entryId}/delete', [FormController::class, 'deleteFormData']);
-    Route::get('/tables/{table}/fields', [FormController::class, 'getTableFields']);
-    Route::get('/tables/{table}/options', [FormController::class, 'getTableFieldOptions']);
-    Route::get('/get-column-values/{table}/{column}', [FormController::class, 'getColumnValues']);
-    Route::post('/{formId}/field-options', [FormController::class, 'saveFieldOptions']);
-    Route::get('/', [FormController::class, 'index']);
-    Route::post('/', [FormController::class, 'store']);
-    Route::delete('/{id}', [FormController::class, 'destroy']);
-    Route::post('/{id}/submit', [FormController::class, 'submitFormData']);
-    Route::get('/{id}/config', [FormController::class, 'getFormConfig']);
-    Route::put('/{formId}/entries/{entryId}/update', [FormController::class, 'updateFormData']);
-    Route::get('/options/{table}/{field}', [FormController::class, 'getFieldOptions']);
-    Route::get('/{id}/columns', [FormController::class, 'getFormColumns']);
+Route::middleware(['api'] )->group(function () {
+    
+    // Routes publiques
+    Route::prefix('forms')->group(function () {
+        // Routes GET publiques
+        Route::get('/', [FormController::class, 'index']);
+        Route::get('/{id}', [FormController::class, 'show']);
+       // Route::get('/{name}', [FormController::class, 'getByName']);
+        Route::get('/id-by-name/{name}', [FormController::class, 'getIdByName']);
+        Route::get('/{id}/config', [FormController::class, 'getFormConfig']);
+        Route::get('/{id}/metadata', [FormController::class, 'getFormMetadata']);
+        Route::get('/table', [FormController::class, 'getAvailableTables']);
+        Route::get('/tables/{table}/fields', [FormController::class, 'getTableFields']);
+        Route::get('/get-column-values/{table}/{column}', [FormController::class, 'getColumnValues']);
+        Route::get('/options/{table}/{field}', [FormController::class, 'getFieldOptions']);
+        Route::get('/users/{formId}/{userId}', [FormController::class, 'getUserFormDetails']);
+        
+        // Routes POST publiques
+        Route::post('/upload', [FormController::class, 'handleFileUpload']);
+        
+        // Routes fichiers publiques
+        Route::get('/{formId}/files/{filename}', [FormController::class, 'getFile'])->where('filename', '.*');
+     Route::get('/{id}/data', [FormController::class, 'getFormData']);
+    });
+
+    // Routes Keycloak publiques
+    Route::prefix('keycloak')->group(function () {
+        Route::post('/users', [KeycloakController::class, 'createUser']);
+        Route::get('/users/check-username', [KeycloakController::class, 'checkUsername']);
+    });
+
+    // Routes protégées par Keycloak
+    Route::middleware(['keycloak'])->group(function () {
+        // Routes formulaires protégées
+        Route::prefix('forms')->group(function () {
+            // Routes POST protégées
+            Route::post('/', [FormController::class, 'store']);
+            Route::post('/{formId}/upload', [FormController::class, 'upload']);
+            Route::post('/{form}/upload', [FormController::class, 'uploadFile']);
+            Route::post('/{formId}/field-options', [FormController::class, 'saveFieldOptions']);
+            Route::post('/{id}/submit', [FormController::class, 'submitFormData']);
+            Route::get('/with-permissions', [FormController::class, 'getFormsWithPermissions']);
+            // Routes PUT protégées
+            Route::put('/{id}', [FormController::class, 'update']);
+            Route::put('/{formId}/entries/{entryId}', [FormController::class, 'updateFormData']);
+            
+            // Routes DELETE protégées
+            Route::delete('/{id}', [FormController::class, 'destroy']);
+            Route::delete('/{formId}/entries/{entryId}', [FormController::class, 'deleteFormData']);
+            Route::delete('/{formId}/files/{filename}', [FormController::class, 'deleteFile']);
+            
+            // Routes GET protégées
+            
+            Route::get('/user/{formId}/entries', [FormController::class, 'getUserFormEntries']);
+            Route::get('/{id}/columns', [FormController::class, 'getFormColumns']);
+        });
+
+        // Route de déconnexion protégée
+        Route::post('/logout', [AuthController::class, 'logoutApi']);
+    });
+    Route::middleware(['api', 'keycloak'])->group(function () {
+    // ... autres routes existantes
+    
+    Route::prefix('keycloak')->group(function () {
+        // ... autres routes keycloak existantes
+        
+        // Nouvelles routes pour la gestion des rôles
+        Route::get('/users', [KeycloakController::class, 'getUsers']);
+        Route::get('/roles', [KeycloakController::class, 'getAvailableRoles']);
+        Route::get('/users/{userId}/roles', [KeycloakController::class, 'getUserRoles']);
+        Route::post('/users/{userId}/roles', [KeycloakController::class, 'assignRolesToUser']);
+        Route::delete('/users/{userId}/roles', [KeycloakController::class, 'revokeRolesFromUser']);
+    });
 });
-
-// Route protégée avec le middleware auth:api pour le logout (Keycloak ou autre)
-Route::middleware('auth:api')->group(function () {
-    Route::post('/logout', [AuthController::class, 'logoutApi']);
 });

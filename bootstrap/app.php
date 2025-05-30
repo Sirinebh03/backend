@@ -12,8 +12,15 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware) {
-        // Ajouter le middleware HandleCors
-        $middleware->append(\App\Http\Middleware\HandleCors::class);
+        $middleware->api([
+            \Illuminate\Http\Middleware\HandleCors::class,
+            // ... autres middlewares
+        ]);
+
+        $middleware->alias([
+            'keycloak' => \App\Http\Middleware\KeycloakAuthenticate::class,
+            'checkFormAccess' => \App\Http\Middleware\CheckFormAccess::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {
         //

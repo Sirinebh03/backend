@@ -7,9 +7,16 @@
     "license": "MIT",
     "require": {
         "php": "^8.2",
+        "firebase/php-jwt": "*",
         "laravel/framework": "^11.31",
+        "laravel/sanctum": "^4.1",
+        "laravel/socialite": "*",
         "laravel/tinker": "^2.9",
-        "stevenmaguire/oauth2-keycloak": "^5.1"
+        "paragonie/sodium_compat": "^1.0",
+        "pusher/pusher-php-server": "^7.2",
+        "socialiteproviders/keycloak": "*",
+        "stevenmaguire/oauth2-keycloak": "^5.1",
+        "web-token/jwt-library": "*"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",

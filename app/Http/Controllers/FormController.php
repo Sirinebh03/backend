@@ -3,6 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\Form;
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -10,13 +12,53 @@ use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
-
-class FormController extends Controller
+use App\Http\Controllers\Controller;
+use App\Http\Controllers\KeycloakController;
+class FormController extends Controller  
 {
-    public function index()
-    {
-        return response()->json(Form::all());
+    
+    
+
+public function index(Request $request)
+{
+    try {
+        $authorizationHeader = $request->header('Authorization');
+        if (!$authorizationHeader || !str_starts_with($authorizationHeader, 'Bearer ')) {
+            return response()->json(['error' => 'Token not provided'], 401);
+        }
+
+        $publicKey = <<<EOD
+-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuACz7povdg/9LIf7Ddhq8dEeC/UyBkVKbZBTNyZ6HIeO538P2QzGP/9UkO5wBqRE/ItxV+PP+siC0t49so2RDllqph9MDPm9fMUbjHUbkHePKAph8Eme5kplwlUayyVuzi1VBmVfr1Z6mnoZYhdliRaeORxnza7ZnW5wIt4hdE3C0n0kcHLr8jnKc6X5m1MA5wG/WOkdpYpgQ6sCmw/pYi6WpnmIxicfJ5A+bbfWsdbDbqPumkBI28cgq5WaRY0IEmIVs8avaZ7Cva4nZ2tacmadw9UqEbBSPRHOhe8aOI4dRmU3R3+JPXM2uYVnk7RZfG1vsxYV/M4cpiVmuMj4ywIDAQAB
+-----END PUBLIC KEY-----
+EOD;
+
+        $jwt = str_replace('Bearer ', '', $authorizationHeader);
+        $decoded = JWT::decode($jwt, new Key($publicKey, 'RS256'));
+        $payload = json_decode(json_encode($decoded), true);
+
+        // Extraire les rôles depuis le token
+        $roles = $payload['resource_access']['laravel']['roles'] ?? [];
+        $role= $payload['realm_access']['roles'] ?? [];
+        $forms = Form::all();
+
+        // Si l'utilisateur est admin, retourner tous les formulaires
+        if (in_array('admin', $role)) {
+            return response()->json($forms);
+        }
+
+        // Sinon, filtrer selon les rôles
+        $filteredForms = $forms->filter(function ($form) use ($roles) {
+            $roleName = 'form_' . Str::slug($form->name, '_');
+            return in_array($roleName, $roles);
+        });
+
+        return response()->json($filteredForms->values());
+
+    } catch (\Exception $e) {
+        return response()->json(['error' => $e->getMessage()], 500);
     }
+}
     public function store(Request $request)
     {
         // Valider les données de base
@@ -80,7 +122,17 @@ class FormController extends Controller
                 'description' => $request->description,
                 'form_data' => json_encode($request->form_data)
             ]);
+          // Création du rôle dans Keycloak
+    $keycloak = new KeycloakController();
+    $roleName = 'form_' . Str::slug($form->name, '_');
     
+    if (!$keycloak->createRole($roleName, 'Role for form '.$form->name)) {
+        DB::rollBack();
+        return response()->json([
+            'message' => 'Form created but failed to create Keycloak role',
+            'warning' => 'Role creation failed'
+        ], 201); // Ou 500 si c'est critique pour vous
+    }
             // Créer la table dynamique
             $this->createDynamicTable($tableName, $request->form_data);
     
@@ -118,6 +170,33 @@ class FormController extends Controller
             ], 500);
         }
     }
+
+    public function getFormsWithPermissions(Request $request)
+{
+    try {
+        $user = $request->attributes->get('keycloak_user');
+        $keycloak = new KeycloakController();
+        
+        $forms = Form::all();
+        $user['roles'];
+        if ($user && isset($user['roles'])) {
+            if (in_array('admin', $user['roles'])) {
+                return response()->json($forms);
+            }
+        }
+
+        
+        $filteredForms = $forms->filter(function($form) use ($user, $keycloak) {
+            $roleName = 'form_' . Str::slug($form->name, '_');
+            return $keycloak->hasRole($user['sub'] ?? '', $roleName);
+        });
+        
+        return response()->json($filteredForms->values());
+        
+    } catch (\Exception $e) {
+        return response()->json(['error' => $e->getMessage()], 500);
+    }
+}
   public function update(Request $request, $id)
 {
     \Log::info('Update Request Data:', $request->all());
@@ -250,12 +329,14 @@ public function handleFileUpload(Request $request)
         $name = Str::lower(Str::slug($name, '_'));
         return preg_match('/^[a-z][a-z0-9_]*$/', $name) ? $name : null;
     }
-
-    private function createDynamicTable(string $tableName, array $fields)
+private function createDynamicTable(string $tableName, array $fields)
     {
         try {
-            Schema::create($tableName, function ($table) use ($fields,$tableName) {
+            Schema::create($tableName, function ($table) use ($fields, $tableName) {
                 $table->increments('id')->unsigned();
+                
+                // Ajout du champ user_id pour Keycloak
+                $table->string('user_id')->nullable()->index();
                 
                 foreach ($fields as $field) {
                     if (!isset($field['name']) || !isset($field['type'])) {
@@ -266,7 +347,7 @@ public function handleFileUpload(Request $request)
                     $type = $field['type'];
                     
                     if ($type === 'multiselect') 
-                       continue; // Gérer séparément
+                       continue;
                     
                     $columnType = $this->mapFieldTypeToMySQL($type);
                     if ($columnType) {
@@ -283,7 +364,6 @@ public function handleFileUpload(Request $request)
             if ($hasMultiselect) {
                 $this->createMultiSelectTables($tableName);
             }
-        
 
         } catch (\Exception $e) {
             \Log::error('Table creation error: '.$e->getMessage());
@@ -737,8 +817,6 @@ public function saveFieldOptions(Request $request, $formId)
             }
         }
         
-        // Rest of your method remains the same...
-        // Gestion des images/fichiers
         foreach ($mediaFields as $field) {
             if (isset($entry->{$field}) && !empty($entry->{$field})) {
                 $filePath = $entry->{$field};
@@ -800,22 +878,48 @@ public function saveFieldOptions(Request $request, $formId)
         ], 404);
     }
 }
-public function submitFormData(Request $request, $id)
+
+ public function submitFormData(Request $request, $id)
 {
     $form = Form::findOrFail($id);
     $tableName = $this->sanitizeTableName($form->name);
     $formData = json_decode($form->form_data, true);
-    
-    if (!is_array($formData)) {
-        return response()->json(['message' => 'Invalid form data format'], 400);
+
+    // Log pour débogage
+    \Log::info('Début de traitement de la soumission pour le formulaire: '.$form->name);
+    \Log::debug('Données reçues:', $request->except(['password', 'token']));
+    \Log::debug('Fichiers reçus:', $request->allFiles());
+
+    // Validation des données
+    $validator = Validator::make($request->all(), [
+        // Vos règles de validation existantes
+    ]);
+
+    // Ajout des règles de validation pour les fichiers
+    foreach ($formData as $field) {
+        if (isset($field['type']) && in_array($field['type'], ['file', 'image'])) {
+            $validator->sometimes($field['name'], 'file|max:10240', function() use ($request, $field) {
+                return $request->hasFile($field['name']);
+            });
+        }
     }
 
-    DB::beginTransaction();
+    if ($validator->fails()) {
+        \Log::error('Erreurs de validation:', $validator->errors()->toArray());
+        return response()->json([
+            'message' => 'Validation error',
+            'errors' => $validator->errors()
+        ], 422);
+    }
 
     try {
-        $dataToInsert = [];
-        $filePaths = [];
+        DB::beginTransaction();
 
+        // 1. Préparation des données avec votre logique existante
+        $user = $request->attributes->get('keycloak_user');
+        $dataToInsert = ['user_id' => $user['sub'] ?? null];
+
+        // 2. Traitement des champs avec votre logique originale
         foreach ($formData as $field) {
             if (!isset($field['name'], $field['type'])) continue;
 
@@ -823,59 +927,81 @@ public function submitFormData(Request $request, $id)
             $fieldType = $field['type'];
             $inputValue = $request->input($fieldName);
 
-            // Gestion des fichiers
+            // 3. Gestion des fichiers (partie corrigée)
             if ($fieldType === 'file' || $fieldType === 'image') {
                 if ($request->hasFile($fieldName)) {
                     $file = $request->file($fieldName);
-                    $path = $file->store("public/uploads/forms/{$id}");
+                    
+                    // Structure de dossiers: /public/uploads/forms/[form_id]/[year]/[month]
+                    $directory = "public/uploads/forms/{$id}/" . date('Y/m');
+                    $filename = Str::uuid() . '.' . $file->getClientOriginalExtension();
+                    
+                    $path = $file->storeAs($directory, $filename);
                     $publicPath = str_replace('public/', 'storage/', $path);
+                    
                     $dataToInsert[$fieldName] = $publicPath;
+                    \Log::info("Fichier uploadé: {$publicPath}");
+                } elseif ($request->filled($fieldName.'_existing')) {
+                    // Conservation du fichier existant en cas d'édition
+                    $dataToInsert[$fieldName] = $request->input($fieldName.'_existing');
+                } else {
+                    $dataToInsert[$fieldName] = null;
                 }
-                continue;
-            }
-            
-            // Gestion des checkbox simples (pas avec options)
+            } 
+            // 4. Conservation de votre logique pour les autres types de champs
             elseif ($fieldType === 'checkbox' && empty($field['options'])) {
                 $dataToInsert[$fieldName] = $inputValue ? 1 : 0;
-            }
-            // Ignorer multiselect (sera traité après)
-            elseif ($fieldType === 'multiselect') {
-                continue;
-            }
-            // Gestion des autres champs
-            else {
+            } elseif ($fieldType === 'multiselect') {
+                continue; // Géré séparément
+            } else {
                 $dataToInsert[$fieldName] = $inputValue;
             }
         }
 
-        // Insertion dans la table principale
+        // 5. Insertion principale (votre logique originale)
         $entryId = DB::table($tableName)->insertGetId($dataToInsert);
+        \Log::info("Entrée créée avec ID: {$entryId}");
 
-        // Gestion multiselect seulement si la table existe
+        // 6. Gestion des multiselect (votre logique originale complète)
         $optionsTable = $tableName.'_multi_option';
         if (Schema::hasTable($optionsTable)) {
             foreach ($formData as $field) {
                 if ($field['type'] === 'multiselect') {
                     $key = $field['name'];
-                    $values = (array)$request->input($key, []);
-                    
-                    foreach ($values as $value) {
+                    $values = $request->input($key, []);
+
+                    // Conversion depuis JSON si nécessaire
+                    if (is_string($values)) {
+                        try {
+                            $values = json_decode($values, true);
+                        } catch (\Exception $e) {
+                            $values = [];
+                        }
+                    }
+
+                    foreach ((array)$values as $value) {
+                        if (empty($value)) continue;
+
+                        // Recherche ou création de l'option
                         $optionId = DB::table($optionsTable)
                             ->where('field_name', $key)
                             ->where('option_value', $value)
                             ->value('id');
-                        
+
                         if (!$optionId) {
                             $optionId = DB::table($optionsTable)->insertGetId([
                                 'field_name' => $key,
-                                'option_value' => $value
+                                'option_value' => $value,
+                                'created_at' => now()
                             ]);
                         }
-                        
+
+                        // Liaison avec l'entrée
                         DB::table($tableName.'_multi_value')->insert([
                             'entry_id' => $entryId,
                             'option_id' => $optionId,
-                            'field_name' => $key
+                            'field_name' => $key,
+                            'created_at' => now()
                         ]);
                     }
                 }
@@ -884,28 +1010,241 @@ public function submitFormData(Request $request, $id)
 
         DB::commit();
 
-        return response()->json([
+        // 7. Préparation de la réponse (votre format original amélioré)
+        $response = [
             'message' => 'Data saved successfully',
-            'entry_id' => $entryId
-        ], 201);
-        
+            'entry_id' => $entryId,
+            'data' => $dataToInsert
+        ];
+
+        // Ajout des URLs des fichiers
+        foreach ($formData as $field) {
+            if (in_array($field['type'], ['file', 'image']) && !empty($dataToInsert[$field['name']])) {
+                $response['files'][$field['name']] = [
+                    'path' => $dataToInsert[$field['name']],
+                    'url' => asset($dataToInsert[$field['name']]),
+                    'filename' => basename($dataToInsert[$field['name']])
+                ];
+            }
+        }
+
+        return response()->json($response, 201);
+
     } catch (\Exception $e) {
         DB::rollBack();
+        \Log::error("Erreur lors de la soumission: ".$e->getMessage());
+        \Log::error("Stack trace: ".$e->getTraceAsString());
         
-        // Supprimer les fichiers uploadés en cas d'erreur
-        foreach ($filePaths as $path) {
-            Storage::delete($path);
-        }
-        
-        \Log::error('Form submission error: '.$e->getMessage());
         return response()->json([
             'message' => 'Error saving data',
-            'error' => $e->getMessage()
+            'error' => $e->getMessage(),
+            'trace' => config('app.debug') ? $e->getTraceAsString() : null
+        ], 500);
+    }
+}
+  public function getUserFormEntries(Request $request, $formId)
+{
+    // Récupérer l'utilisateur depuis le middleware Keycloak
+    $user = $request->attributes->get('keycloak_user');
+    
+    if (!$user || !isset($user['sub'])) {
+        return response()->json(['message' => 'Unauthorized - Invalid Keycloak token or missing user ID'], 401);
+    }
+
+    $form = Form::findOrFail($formId);
+    $tableName = $this->sanitizeTableName($form->name);
+     $formData = json_decode($form->form_data, true) ?: [];
+    // Récupérer les entrées de l'utilisateur
+    $entries = DB::table($tableName)
+                ->where('user_id', $user['sub'])
+                ->get();
+
+    // Si vous avez besoin de traiter les champs multiselect ou fichiers :
+    $formData = json_decode($form->form_data, true);
+    $fieldTypes = collect($formData)
+        ->mapWithKeys(function ($field) {
+            return [$field['name'] => $field['type'] ?? null];
+        })
+        ->filter();
+
+    $multiselectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
+    $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['image', 'file']))->keys()->toArray();
+
+    // Traiter chaque entrée pour ajouter les données supplémentaires
+    $entries->transform(function ($entry) use ($tableName, $multiselectFields, $mediaFields, $formId) {
+        // Gestion des multiselects
+        if (!empty($multiselectFields)) {
+            foreach ($multiselectFields as $field) {
+                $options = DB::table($tableName.'_multi_value')
+                    ->join($tableName.'_multi_option', 'option_id', '=', 'id')
+                    ->where('entry_id', $entry->id)
+                    ->where('field_name', $field)
+                    ->pluck('option_value')
+                    ->toArray();
+                
+                $entry->{$field} = $options;
+            }
+        }
+
+        // Gestion des fichiers/images
+        foreach ($mediaFields as $field) {
+            if (!empty($entry->{$field})) {
+                $filePath = $entry->{$field};
+                
+                if (strpos($filePath, 'storage/') === 0) {
+                    $entry->{$field} = [
+                        'path' => $filePath,
+                        'url' => asset($filePath),
+                        'filename' => basename($filePath)
+                    ];
+                } else {
+                    $relativePath = "uploads/forms/{$formId}/".basename($filePath);
+                    $storagePath = "storage/{$relativePath}";
+                    
+                    $entry->{$field} = [
+                        'path' => $storagePath,
+                        'url' => asset($storagePath),
+                        'filename' => basename($filePath)
+                    ];
+                }
+            }
+        }
+
+        return $entry;
+    });
+
+    return response()->json([
+        'entries' => $entries,
+        'form_data' => $formData 
+    ]);
+}
+
+
+public function getUserFormDetails($userId, $formId)
+{
+    try {
+        // 1. Vérifier que le formulaire existe
+        $form = Form::findOrFail($formId);
+        $tableName = $this->sanitizeTableName($form->name);
+        
+        // 2. Vérifier que la table du formulaire existe
+        if (!Schema::hasTable($tableName)) {
+            return response()->json([
+                'message' => 'Table associée au formulaire non trouvée'
+            ], 404);
+        }
+
+        // 3. Récupérer l'entrée spécifique de l'utilisateur
+        $entry = DB::table($tableName)
+            ->where('user_id', $userId)
+            ->where('id', $formId) // Supposant que formId est en fait l'ID de l'entrée
+            ->first();
+
+        if (!$entry) {
+            return response()->json([
+                'message' => 'Formulaire non trouvé pour cet utilisateur'
+            ], 404);
+        }
+
+        // 4. Récupérer la structure du formulaire
+        $formData = json_decode($form->form_data, true) ?: [];
+        
+        // 5. Traiter les différents types de champs
+        $processedData = $this->processFormEntry($entry, $formData, $tableName);
+
+        // 6. Retourner la réponse structurée
+        return response()->json([
+            'form' => [
+                'id' => $form->id,
+                'name' => $form->name,
+                'description' => $form->description,
+                'created_at' => $form->created_at,
+                'updated_at' => $form->updated_at
+            ],
+            'entry' => $processedData,
+            'submitted_at' => $entry->created_at
+        ]);
+
+    } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
+        return response()->json([
+            'message' => 'Formulaire non trouvé'
+        ], 404);
+    } catch (\Exception $e) {
+        \Log::error("Erreur lors de la récupération des détails du formulaire: " . $e->getMessage());
+        return response()->json([
+            'message' => 'Erreur serveur lors de la récupération des données',
+            'error' => config('app.debug') ? $e->getMessage() : null
         ], 500);
     }
 }
 
+/**
+ * Traite une entrée de formulaire pour structurer les données
+ */
+private function processFormEntry($entry, $formData, $tableName)
+{
+    $result = (array)$entry;
+    unset($result['created_at'], $result['updated_at']);
 
+    $fieldTypes = collect($formData)
+        ->mapWithKeys(function ($field) {
+            return [$field['name'] => $field['type'] ?? null];
+        })
+        ->filter();
+
+    // Traitement des champs multiselect
+    $multiSelectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
+    if (!empty($multiSelectFields)) {
+        $this->processMultiSelectFields($result, $entry->id, $tableName, $multiSelectFields);
+    }
+
+    // Traitement des fichiers/images
+    $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['file', 'image']))->keys()->toArray();
+    if (!empty($mediaFields)) {
+        $this->processMediaFields($result, $mediaFields);
+    }
+
+    return $result;
+}
+
+/**
+ * Traite les champs multiselect
+ */
+private function processMultiSelectFields(&$data, $entryId, $tableName, $fields)
+{
+    if (!Schema::hasTable($tableName.'_multi_value')) {
+        return;
+    }
+
+    foreach ($fields as $field) {
+        $options = DB::table($tableName.'_multi_value')
+            ->join($tableName.'_multi_option', 'option_id', '=', 'id')
+            ->where('entry_id', $entryId)
+            ->where('field_name', $field)
+            ->pluck('option_value')
+            ->toArray();
+
+        $data[$field] = $options;
+    }
+}
+
+/**
+ * Traite les champs fichiers/images
+ */
+private function processMediaFields(&$data, $fields)
+{
+    foreach ($fields as $field) {
+        if (!empty($data[$field])) {
+            $data[$field] = [
+                'path' => $data[$field],
+                'url' => asset($data[$field]),
+                'filename' => basename($data[$field])
+            ];
+        } else {
+            $data[$field] = null;
+        }
+    }
+}
 public function getTableFieldOptions(Request $request, $table)
 {
     $request->validate([
@@ -1357,6 +1696,34 @@ public function getMultiselectOptions($formId, $fieldName)
     return response()->json($options);
 }
 
-    
+// Dans FormController.php
+
+public function manageFormPermissions(Request $request, $formId)
+{
+    $form = Form::findOrFail($formId);
+    $roleName = 'form_' . Str::slug($form->name, '_');
+
+    $request->validate([
+        'user_id' => 'required|string',
+        'action' => 'required|in:grant,revoke'
+    ]);
+
+    try {
+        $keycloak = new KeycloakController();
+        
+        if ($request->action === 'grant') {
+            $keycloak->assignRoleToUser($request->user_id, $roleName);
+            $message = 'Permission granted successfully';
+        } else {
+            $keycloak->revokeRoleFromUser($request->user_id, $roleName);
+            $message = 'Permission revoked successfully';
+        }
+
+        return response()->json(['message' => $message]);
+
+    } catch (\Exception $e) {
+        return response()->json(['error' => $e->getMessage()], 500);
+    }
+}
 
 }

@@ -35,13 +35,12 @@ return [
         ],
     ],
 
-    'keycloak' => [
-    'client_id' => env('KEYCLOAK_CLIENT_ID'),
-    'client_secret' => env('KEYCLOAK_CLIENT_SECRET'),
-    'redirect' => env('KEYCLOAK_REDIRECT_URI'),
-    'base_url' => env('KEYCLOAK_BASE_URL'),
-    'realm' => env('KEYCLOAK_REALM'),
-    'logout_uri' => env('KEYCLOAK_LOGOUT_URI'),
+ 'keycloak' => [
+    'base_url' => env('KEYCLOAK_BASE_URL', 'http://localhost:8080'),
+    'realm' => env('KEYCLOAK_REALM', 'pfe'),
+    'frontend_client_id' => env('KEYCLOAK_FRONTEND_CLIENT_ID', 'angular-public'),
+    'backend_client_id' => env('KEYCLOAK_BACKEND_CLIENT_ID', 'laravel-backend'),
+    'backend_client_secret' => env('KEYCLOAK_BACKEND_CLIENT_SECRET'),
 ],
 
 ];
