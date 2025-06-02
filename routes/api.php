@@ -21,7 +21,6 @@ Route::middleware(['api'] )->group(function () {
         Route::get('/get-column-values/{table}/{column}', [FormController::class, 'getColumnValues']);
         Route::get('/options/{table}/{field}', [FormController::class, 'getFieldOptions']);
         Route::get('/users/{formId}/{userId}', [FormController::class, 'getUserFormDetails']);
-        
         // Routes POST publiques
         Route::post('/upload', [FormController::class, 'handleFileUpload']);
         
@@ -60,6 +59,9 @@ Route::middleware(['api'] )->group(function () {
             
             Route::get('/user/{formId}/entries', [FormController::class, 'getUserFormEntries']);
             Route::get('/{id}/columns', [FormController::class, 'getFormColumns']);
+            Route::get('/userform/{userId}', [KeycloakController::class, 'getFormUser']);
+            Route::get('/auth/has-role', [KeycloakController::class, 'hasRole']);
+
         });
 
         // Route de déconnexion protégée
@@ -70,13 +72,15 @@ Route::middleware(['api'] )->group(function () {
     
     Route::prefix('keycloak')->group(function () {
         // ... autres routes keycloak existantes
-        
+         Route::get('/users/{userId}', [KeycloakController::class, 'getUser']);
+
         // Nouvelles routes pour la gestion des rôles
         Route::get('/users', [KeycloakController::class, 'getUsers']);
         Route::get('/roles', [KeycloakController::class, 'getAvailableRoles']);
         Route::get('/users/{userId}/roles', [KeycloakController::class, 'getUserRoles']);
         Route::post('/users/{userId}/roles', [KeycloakController::class, 'assignRolesToUser']);
         Route::delete('/users/{userId}/roles', [KeycloakController::class, 'revokeRolesFromUser']);
+        Route::get('/users/count', [KeycloakController::class, 'countUsers']);
     });
 });
 });

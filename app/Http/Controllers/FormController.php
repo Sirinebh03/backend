@@ -188,7 +188,7 @@ EOD;
         
         $filteredForms = $forms->filter(function($form) use ($user, $keycloak) {
             $roleName = 'form_' . Str::slug($form->name, '_');
-            return $keycloak->hasRole($user['sub'] ?? '', $roleName);
+            return $keycloak->hasRoles($user['sub'] ?? '', $roleName);
         });
         
         return response()->json($filteredForms->values());
@@ -777,81 +777,183 @@ public function saveFieldOptions(Request $request, $formId)
     }
 
 
-    public function getFormData($id)
+ public function getFormData($id)
 {
-    $form = Form::findOrFail($id);
-    $tableName = strtolower(str_replace(' ', '_', $form->name));
-    
-    $entries = DB::table($tableName)->get();
-    
-    $formData = json_decode($form->form_data, true);
-    
-    $fieldTypes = collect($formData)
-        ->mapWithKeys(function ($field) {
-            return [$field['name'] => $field['type'] ?? null];
-        })
-        ->filter();
-    
-    $multiselectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
-    $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['image', 'file']))->keys()->toArray();
-    
-    $entries->transform(function ($entry) use ($tableName, $multiselectFields, $mediaFields, $id) {
-        // Gestion des multiselects
-        if (!empty($multiselectFields) && Schema::hasTable($tableName.'_multi_value')) {
-            $multiselects = DB::table($tableName.'_multi_value')
-                ->join($tableName.'_multi_option', 'option_id', '=', 'id')
-                ->where('entry_id', $entry->id)
-                ->whereIn($tableName.'_multi_value.field_name', $multiselectFields) // Specify table for field_name
-                ->get()
-                ->groupBy('field_name');
+    try {
+        $form = Form::findOrFail($id);
+        $tableName = $this->sanitizeTableName($form->name);
+        
+        // Récupérer les entrées avec une limite raisonnable pour éviter les problèmes de mémoire
+        $entries = DB::table($tableName)->paginate(100);
+        
+        $formData = json_decode($form->form_data, true) ?: [];
+        
+        // Préparer les types de champs
+        $fieldTypes = collect($formData)
+            ->mapWithKeys(function ($field) {
+                return [$field['name'] => $field['type'] ?? null];
+            })
+            ->filter();
+        
+        $multiselectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
+        $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['image', 'file']))->keys()->toArray();
+        
+        // Récupérer tous les user_id distincts pour optimisation
+        $userIds = collect($entries->items())->pluck('user_id')->unique()->filter()->values()->toArray();
+        
+        // Précharger les informations utilisateur en une seule fois
+        $usersInfo = $this->getUsersInfoBatch($userIds);
+        
+        // Transformer les entrées
+        $transformedItems = collect($entries->items())->map(function ($entry) use (
+            $tableName, 
+            $multiselectFields, 
+            $mediaFields, 
+            $id,
+            $usersInfo
+        ) {
+            // Convertir en tableau pour manipulation
+            $entryArray = (array)$entry;
             
-            foreach ($multiselects as $field => $options) {
-                $entry->{$field} = $options->pluck('option_value')->toArray();
+            // Ajouter les informations utilisateur si user_id existe
+            if (!empty($entryArray['user_id'])) {
+                $entryArray['user_info'] = $usersInfo[$entryArray['user_id']] ?? null;
             }
             
-            // Initialiser les champs multiselect vides
-            foreach ($multiselectFields as $field) {
-                if (!isset($entry->{$field})) {
-                    $entry->{$field} = [];
-                }
+            // Gestion des multiselects
+            if (!empty($multiselectFields)) {
+                $this->processMultiselectFields($entryArray, $tableName, $multiselectFields);
             }
+            
+            // Gestion des fichiers
+            $this->processMediaFields($entryArray, $mediaFields, $id);
+            
+            return $entryArray;
+        });
+        
+        // Construire la réponse paginée
+        $response = [
+            'form_data' => $formData,
+            'entries' => new \Illuminate\Pagination\LengthAwarePaginator(
+                $transformedItems,
+                $entries->total(),
+                $entries->perPage(),
+                $entries->currentPage(),
+                [
+                    'path' => \Illuminate\Pagination\Paginator::resolveCurrentPath(),
+                    'pageName' => 'page',
+                ]
+            )
+        ];
+        
+        return response()->json($response);
+        
+    } catch (\Exception $e) {
+        \Log::error("Error getting form data for form {$id}: " . $e->getMessage());
+        return response()->json([
+            'message' => 'Error retrieving form data',
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
+protected function getUsersInfoBatch(array $userIds): array
+{
+    if (empty($userIds)) {
+        return [];
+    }
+    
+    $usersInfo = [];
+    $keycloak = new KeycloakController();
+    
+    foreach ($userIds as $userId) {
+        try {
+            $response = $keycloak->getUser($userId);
+            
+            if ($response->getStatusCode() === 200) {
+                $userData = $response->getData(true);
+                $usersInfo[$userId] = [
+                    'username' => $userData['username'] ?? null,
+                    'email' => $userData['email'] ?? null,
+                    'firstName' => $userData['firstName'] ?? null,
+                    'lastName' => $userData['lastName'] ?? null
+                ];
+            } else {
+                \Log::warning("Failed to fetch user info for {$userId}, status: ".$response->getStatusCode());
+                $usersInfo[$userId] = null;
+            }
+        } catch (\Exception $e) {
+            \Log::error("Failed to fetch user info for {$userId}: " . $e->getMessage());
+            $usersInfo[$userId] = null;
+        }
+    }
+    
+    return $usersInfo;
+}
+
+protected function processMultiselectFields(array &$entry, string $tableName, array $multiselectFields): void
+{
+    if (!Schema::hasTable($tableName.'_multi_value')) {
+        return;
+    }
+    
+    try {
+        $multiselects = DB::table($tableName.'_multi_value')
+            ->join($tableName.'_multi_option', 'option_id', '=', 'id')
+            ->where('entry_id', $entry['id'])
+            ->whereIn($tableName.'_multi_value.field_name', $multiselectFields)
+            ->get()
+            ->groupBy('field_name');
+        
+        foreach ($multiselects as $field => $options) {
+            $entry[$field] = $options->pluck('option_value')->toArray();
         }
         
-        foreach ($mediaFields as $field) {
-            if (isset($entry->{$field}) && !empty($entry->{$field})) {
-                $filePath = $entry->{$field};
+        // Initialiser les champs multiselect vides
+        foreach ($multiselectFields as $field) {
+            if (!isset($entry[$field])) {
+                $entry[$field] = [];
+            }
+        }
+    } catch (\Exception $e) {
+        \Log::error("Error processing multiselect fields for entry {$entry['id']}: " . $e->getMessage());
+    }
+}
+
+protected function processMediaFields(array &$entry, array $mediaFields, int $formId): void
+{
+    foreach ($mediaFields as $field) {
+        try {
+            if (!empty($entry[$field])) {
+                $filePath = $entry[$field];
                 
                 if (strpos($filePath, 'storage/') === 0) {
-                    $entry->{$field} = [
+                    $entry[$field] = [
                         'path' => $filePath,
                         'url' => asset($filePath),
-                        'filename' => basename($filePath)
+                        'filename' => basename($filePath),
+                        'exists' => Storage::exists(str_replace('storage/', 'public/', $filePath))
                     ];
                 } else {
-                    $relativePath = "uploads/forms/{$id}/".basename($filePath);
+                    $relativePath = "uploads/forms/{$formId}/".basename($filePath);
                     $storagePath = "storage/{$relativePath}";
+                    $publicPath = "public/{$relativePath}";
                     
-                    $entry->{$field} = [
+                    $entry[$field] = [
                         'path' => $storagePath,
                         'url' => asset($storagePath),
-                        'filename' => basename($filePath)
+                        'filename' => basename($filePath),
+                        'exists' => Storage::exists($publicPath)
                     ];
                 }
-                
-                $storagePath = str_replace('storage/', 'public/', $entry->{$field}['path']);
-                $entry->{$field}['exists'] = Storage::exists($storagePath);
             } else {
-                $entry->{$field} = null;
+                $entry[$field] = null;
             }
+        } catch (\Exception $e) {
+            \Log::error("Error processing media field {$field} for form {$formId}: " . $e->getMessage());
+            $entry[$field] = null;
         }
-        
-        return $entry;
-    });
-    
-    return response()->json([
-        'form_data' => $formData,
-        'entries' => $entries
-    ]);
+    }
 }
     public function getFormMetadata($id)
 {
@@ -1119,69 +1221,90 @@ public function saveFieldOptions(Request $request, $formId)
     ]);
 }
 
-
-public function getUserFormDetails($userId, $formId)
+public function getUserFormDetails($formId, $userId)
 {
     try {
-        // 1. Vérifier que le formulaire existe
+        // Vérifier que le formulaire existe
         $form = Form::findOrFail($formId);
         $tableName = $this->sanitizeTableName($form->name);
-        
-        // 2. Vérifier que la table du formulaire existe
-        if (!Schema::hasTable($tableName)) {
-            return response()->json([
-                'message' => 'Table associée au formulaire non trouvée'
-            ], 404);
-        }
+        $formData = json_decode($form->form_data, true) ?? [];
 
-        // 3. Récupérer l'entrée spécifique de l'utilisateur
+        // Obtenir la première entrée de l'utilisateur pour ce formulaire
         $entry = DB::table($tableName)
             ->where('user_id', $userId)
-            ->where('id', $formId) // Supposant que formId est en fait l'ID de l'entrée
             ->first();
 
         if (!$entry) {
             return response()->json([
-                'message' => 'Formulaire non trouvé pour cet utilisateur'
+                'message' => 'Aucune entrée trouvée pour cet utilisateur et ce formulaire.'
             ], 404);
         }
 
-        // 4. Récupérer la structure du formulaire
-        $formData = json_decode($form->form_data, true) ?: [];
-        
-        // 5. Traiter les différents types de champs
-        $processedData = $this->processFormEntry($entry, $formData, $tableName);
+        // Déterminer les types de champs (multiselect, fichier, etc.)
+        $fieldTypes = collect($formData)
+            ->mapWithKeys(fn($field) => [$field['name'] => $field['type'] ?? null])
+            ->filter();
 
-        // 6. Retourner la réponse structurée
+        $multiselectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
+        $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['image', 'file']))->keys()->toArray();
+
+        // Convertir l'entrée en objet modifiable
+        $entry = collect((array) $entry);
+
+        // Gestion des multiselects
+        foreach ($multiselectFields as $field) {
+            $options = DB::table($tableName . '_multi_value')
+                ->join($tableName . '_multi_option', $tableName . '_multi_value.option_id', '=', $tableName . '_multi_option.id')
+                ->where('entry_id', $entry['id'])
+                ->where('field_name', $field)
+                ->pluck('option_value')
+                ->toArray();
+
+            $entry[$field] = $options;
+        }
+
+        // Gestion des fichiers/images
+        foreach ($mediaFields as $field) {
+            if (!empty($entry[$field])) {
+                $filePath = $entry[$field];
+
+                if (strpos($filePath, 'storage/') === 0) {
+                    $entry[$field] = [
+                        'path' => $filePath,
+                        'url' => asset($filePath),
+                        'filename' => basename($filePath)
+                    ];
+                } else {
+                    $relativePath = "uploads/forms/{$formId}/" . basename($filePath);
+                    $storagePath = "storage/{$relativePath}";
+
+                    $entry[$field] = [
+                        'path' => $storagePath,
+                        'url' => asset($storagePath),
+                        'filename' => basename($filePath)
+                    ];
+                }
+            }
+        }
+
         return response()->json([
-            'form' => [
-                'id' => $form->id,
-                'name' => $form->name,
-                'description' => $form->description,
-                'created_at' => $form->created_at,
-                'updated_at' => $form->updated_at
-            ],
-            'entry' => $processedData,
-            'submitted_at' => $entry->created_at
+            'entry' => $entry,
+            'form_data' => $formData,
+            'form' => $form
         ]);
-
-    } catch (\Illuminate\Database\Eloquent\ModelNotFoundException $e) {
-        return response()->json([
-            'message' => 'Formulaire non trouvé'
-        ], 404);
     } catch (\Exception $e) {
-        \Log::error("Erreur lors de la récupération des détails du formulaire: " . $e->getMessage());
         return response()->json([
-            'message' => 'Erreur serveur lors de la récupération des données',
-            'error' => config('app.debug') ? $e->getMessage() : null
+            'message' => 'Erreur lors de la récupération des données',
+            'error' => $e->getMessage()
         ], 500);
     }
 }
 
+
 /**
  * Traite une entrée de formulaire pour structurer les données
  */
-private function processFormEntry($entry, $formData, $tableName)
+private function processFormEntry($entry, $formData, $tableName, $formId)
 {
     $result = (array)$entry;
     unset($result['created_at'], $result['updated_at']);
@@ -1195,56 +1318,20 @@ private function processFormEntry($entry, $formData, $tableName)
     // Traitement des champs multiselect
     $multiSelectFields = $fieldTypes->filter(fn($type) => $type === 'multiselect')->keys()->toArray();
     if (!empty($multiSelectFields)) {
-        $this->processMultiSelectFields($result, $entry->id, $tableName, $multiSelectFields);
+        $this->processMultiSelectFields($result, $tableName,
+         $multiSelectFields);
+
     }
 
     // Traitement des fichiers/images
     $mediaFields = $fieldTypes->filter(fn($type) => in_array($type, ['file', 'image']))->keys()->toArray();
     if (!empty($mediaFields)) {
-        $this->processMediaFields($result, $mediaFields);
+        $this->processMediaFields($result, $mediaFields, $formId);
     }
 
     return $result;
 }
 
-/**
- * Traite les champs multiselect
- */
-private function processMultiSelectFields(&$data, $entryId, $tableName, $fields)
-{
-    if (!Schema::hasTable($tableName.'_multi_value')) {
-        return;
-    }
-
-    foreach ($fields as $field) {
-        $options = DB::table($tableName.'_multi_value')
-            ->join($tableName.'_multi_option', 'option_id', '=', 'id')
-            ->where('entry_id', $entryId)
-            ->where('field_name', $field)
-            ->pluck('option_value')
-            ->toArray();
-
-        $data[$field] = $options;
-    }
-}
-
-/**
- * Traite les champs fichiers/images
- */
-private function processMediaFields(&$data, $fields)
-{
-    foreach ($fields as $field) {
-        if (!empty($data[$field])) {
-            $data[$field] = [
-                'path' => $data[$field],
-                'url' => asset($data[$field]),
-                'filename' => basename($data[$field])
-            ];
-        } else {
-            $data[$field] = null;
-        }
-    }
-}
 public function getTableFieldOptions(Request $request, $table)
 {
     $request->validate([
@@ -1725,5 +1812,4 @@ public function manageFormPermissions(Request $request, $formId)
         return response()->json(['error' => $e->getMessage()], 500);
     }
 }
-
 }

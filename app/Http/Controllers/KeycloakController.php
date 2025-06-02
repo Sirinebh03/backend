@@ -5,6 +5,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
+    use Illuminate\Support\Str;
 
 class KeycloakController extends Controller
 {
@@ -32,6 +33,254 @@ class KeycloakController extends Controller
             return [];
         }
     }
+
+
+public function getFormUser($userId)
+{
+    \Log::info("Début de récupération des formulaires accessibles par l'utilisateur", ['userId' => $userId]);
+
+    try {
+        // 1. Obtenir l'utilisateur depuis Keycloak via la méthode existante
+        $response = $this->getUser($userId);
+        $data = $response->getData(true);
+
+        if (!isset($data['form_roles']) || !is_array($data['form_roles'])) {
+            return response()->json(['forms' => []]);
+        }
+
+        $userRoles = $data['form_roles'];
+
+        // 2. Récupérer tous les formulaires disponibles dans la base
+        $forms = \App\Models\Form::all();
+        $accessibleForms = [];
+
+        foreach ($forms as $form) {
+            $expectedRole = 'form_' . Str::slug($form->name, '_');
+
+            if (in_array($expectedRole, $userRoles)) {
+                $accessibleForms[] = [
+                    'id' => $form->id,
+                    'name' => $form->name,
+                    'created_at' => $form->created_at,
+                    // Ajoute d'autres champs si nécessaire
+                ];
+            }
+        }
+
+        \Log::info("Formulaires accessibles récupérés avec succès", [
+            'userId' => $userId,
+            'form_count' => count($accessibleForms)
+        ]);
+
+        return response()->json(['forms' => $accessibleForms]);
+
+    } catch (\Exception $e) {
+        \Log::error("Erreur lors de la récupération des formulaires de l'utilisateur", [
+            'userId' => $userId,
+            'error' => $e->getMessage()
+        ]);
+
+        return response()->json([
+            'error' => 'Failed to retrieve forms for user',
+            'message' => $e->getMessage(),
+        ], 500);
+    }
+}
+
+public function getUser($userId)
+{
+    \Log::info("Début de la récupération de l'utilisateur Keycloak", ['userId' => $userId]);
+
+    try {
+        // 1. Get Keycloak configuration
+        $keycloakBaseUrl = config('services.keycloak.base_url');
+        $realm = config('services.keycloak.realm');
+        $clientId = config('services.keycloak.backend_client_id');
+        $clientSecret = config('services.keycloak.backend_client_secret');
+        
+        \Log::debug("Configuration Keycloak récupérée", [
+            'base_url' => $keycloakBaseUrl,
+            'realm' => $realm,
+            'client_id' => $clientId,
+            'client_secret' => !empty($clientSecret) ? '***'.substr($clientSecret, -4) : null,
+        ]);
+
+        if (empty($keycloakBaseUrl) || empty($realm) || empty($clientId) || empty($clientSecret)) {
+            $missing = [];
+            empty($keycloakBaseUrl) && $missing[] = 'base_url';
+            empty($realm) && $missing[] = 'realm';
+            empty($clientId) && $missing[] = 'client_id';
+            empty($clientSecret) && $missing[] = 'client_secret';
+            
+            $errorMsg = 'Configuration Keycloak incomplète. Paramètres manquants: '.implode(', ', $missing);
+            \Log::error($errorMsg);
+            throw new \Exception($errorMsg);
+        }
+
+        // 2. Get admin access token
+        $tokenUrl = "$keycloakBaseUrl/realms/$realm/protocol/openid-connect/token";
+        \Log::debug("Tentative d'obtention du token admin", ['url' => $tokenUrl]);
+        
+        $tokenResponse = Http::asForm()->post($tokenUrl, [
+            'grant_type' => 'client_credentials',
+            'client_id' => $clientId,
+            'client_secret' => $clientSecret,
+        ]);
+
+        \Log::debug("Réponse de l'endpoint token", [
+            'status' => $tokenResponse->status(),
+            'body' => $tokenResponse->successful() ? '***' : $tokenResponse->body()
+        ]);
+
+        if (!$tokenResponse->successful()) {
+            $errorMsg = 'Échec de récupération du token admin: '.$tokenResponse->body();
+            \Log::error($errorMsg, [
+                'status' => $tokenResponse->status(),
+                'headers' => $tokenResponse->headers(),
+            ]);
+            throw new \Exception($errorMsg);
+        }
+
+        $accessToken = $tokenResponse->json('access_token');
+        \Log::debug("Token admin obtenu avec succès", ['token' => '***'.substr($accessToken, -10)]);
+
+        // 3. Get user details from Keycloak
+        $userUrl = "$keycloakBaseUrl/admin/realms/$realm/users/$userId";
+        \Log::debug("Tentative de récupération des détails utilisateur", ['url' => $userUrl]);
+
+        $userResponse = Http::withHeaders([
+            'Authorization' => "Bearer $accessToken",
+            'Accept' => 'application/json',
+            'Content-Type' => 'application/json',
+        ])->get($userUrl);
+
+        \Log::debug("Réponse des détails utilisateur", [
+            'status' => $userResponse->status(),
+            'body' => $userResponse->successful() ? '***' : $userResponse->body()
+        ]);
+
+        if ($userResponse->status() === 404) {
+            \Log::warning("Utilisateur non trouvé dans Keycloak", ['userId' => $userId]);
+            return response()->json(['error' => 'User not found'], 404);
+        }
+
+        if (!$userResponse->successful()) {
+            $errorMsg = 'Échec de récupération des détails utilisateur: '.$userResponse->body();
+            \Log::error($errorMsg, [
+                'status' => $userResponse->status(),
+                'headers' => $userResponse->headers(),
+            ]);
+            throw new \Exception($errorMsg);
+        }
+
+        $userData = $userResponse->json();
+        \Log::debug("Détails utilisateur obtenus", ['userData' => array_keys($userData)]);
+
+        // 4. Get client-level roles for laravel client
+        $formRoles = [];
+        
+        // First get laravel client ID
+        $clientsUrl = "$keycloakBaseUrl/admin/realms/$realm/clients";
+        $clientsResponse = Http::withHeaders([
+            'Authorization' => "Bearer $accessToken",
+            'Accept' => 'application/json',
+        ])->get($clientsUrl, ['clientId' => 'laravel']);
+
+        if ($clientsResponse->successful() && !empty($clientsResponse->json())) {
+            $laravelClient = $clientsResponse->json()[0];
+            $laravelClientId = $laravelClient['id'];
+            
+            // Get role mappings for this client
+            $clientRolesUrl = "$keycloakBaseUrl/admin/realms/$realm/users/$userId/role-mappings/clients/$laravelClientId";
+            $clientRolesResponse = Http::withHeaders([
+                'Authorization' => "Bearer $accessToken",
+                'Accept' => 'application/json',
+            ])->get($clientRolesUrl);
+
+            if ($clientRolesResponse->successful()) {
+                $clientRoles = $clientRolesResponse->json();
+                
+                // Filter only the roles we want
+                foreach ($clientRoles as $role) {
+                    if (in_array($role['name'], ['form_maaa', 'form_employe'])) {
+                        $formRoles[] = $role['name'];
+                    }
+                }
+            }
+        }
+
+        // 5. Format the response
+        $responseData = [
+            'id' => $userData['id'] ?? null,
+            'username' => $userData['username'] ?? null,
+            'email' => $userData['email'] ?? null,
+            'firstName' => $userData['firstName'] ?? null,
+            'lastName' => $userData['lastName'] ?? null,
+            'enabled' => $userData['enabled'] ?? false,
+            'emailVerified' => $userData['emailVerified'] ?? false,
+            'form_roles' => $formRoles, // Only the specific roles we want
+            'attributes' => $userData['attributes'] ?? [],
+            'createdAt' => isset($userData['createdTimestamp']) 
+                ? date('Y-m-d H:i:s', $userData['createdTimestamp'] / 1000)
+                : null,
+        ];
+
+        \Log::info("Utilisateur récupéré avec succès", [
+            'userId' => $userId,
+            'form_roles' => $formRoles
+        ]);
+        return response()->json($responseData);
+
+    } catch (\Exception $e) {
+        \Log::error("Échec critique lors de la récupération de l'utilisateur Keycloak", [
+            'userId' => $userId,
+            'error' => $e->getMessage(),
+            'stackTrace' => $e->getTraceAsString()
+        ]);
+        
+        return response()->json([
+            'error' => 'Failed to retrieve user information',
+            'message' => $e->getMessage(),
+            'request_id' => request()->header('X-Request-ID')
+        ], 500);
+    }
+}
+public function countUsers()
+{
+    try {
+        $token = $this->getAdminToken();
+        $realm = config('services.keycloak.realm');
+
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $token,
+            'Content-Type' => 'application/json'
+        ])->get(config('services.keycloak.base_url') . '/admin/realms/' . $realm . '/users', [
+            'briefRepresentation' => false,
+            'max' => 1000 // tu peux ajuster selon la taille de ton Keycloak
+        ]);
+
+        if ($response->successful()) {
+         $data = $response->json();
+if (is_array($data)) {
+    $keys = array_keys($data); // ✅ OK
+} else {
+    $keys = []; // ou autre logique si tu sais que ce n’est pas un tableau
+}
+
+
+        }
+
+        // Si la requête HTTP a échoué
+        throw new \Exception("HTTP error: " . $response->status() . " - " . $response->body());
+
+    } catch (\Exception $e) {
+        return response()->json([
+            'count' => 0,
+            'error' => $e->getMessage()
+        ], 500);
+    }
+}
+
        public function createUser(Request $request)
     {
         try {
@@ -500,7 +749,40 @@ public function assignRoleToUser($userId, $roleName)
 
     return $assignResponse->successful();
 }
-public function hasRole($userId, $roleName)
+public function hasRole(Request $request)
+{
+    $userId = $request->query('userId');
+    $roleName = $request->query('roleName');
+
+    if (!$userId || !$roleName) {
+        return response()->json(['hasRole' => false, 'error' => 'Missing parameters'], 400);
+    }
+
+    try {
+        $token = $this->getAdminToken();
+        $clientId = $this->getClientId($token);
+        
+        $url = config('services.keycloak.base_url') . '/admin/realms/' . config('services.keycloak.realm') . '/users/' . $userId . '/role-mappings/clients/' . $clientId;
+        
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $token,
+            'Content-Type' => 'application/json'
+        ])->get($url);
+
+        if ($response->successful()) {
+            $roles = $response->json();
+            $hasRole = collect($roles)->contains('name', $roleName);
+            return response()->json(['hasRole' => $hasRole]);
+        }
+
+        throw new \Exception('Failed to get user roles: '.$response->body());
+
+    } catch (\Exception $e) {
+        Log::error('Failed to check user role', ['error' => $e->getMessage()]);
+        return response()->json(['hasRole' => false, 'error' => $e->getMessage()], 500);
+    }
+}
+public function hasRoles($userId, $roleName)
 {
     try {
         $token = $this->getAdminToken();
