@@ -14,6 +14,11 @@ use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 use App\Http\Controllers\Controller;
 use App\Http\Controllers\KeycloakController;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Log;
+use App\Notifications\RoleUpdatedNotification;
+use Illuminate\Support\Facades\Http;
+
 class FormController extends Controller  
 {
     
@@ -197,7 +202,7 @@ EOD;
         return response()->json(['error' => $e->getMessage()], 500);
     }
 }
-  public function update(Request $request, $id)
+ public function update(Request $request, $id)
 {
     \Log::info('Update Request Data:', $request->all());
 
@@ -227,22 +232,57 @@ EOD;
     $form = Form::findOrFail($id);
     $oldTableName = $this->sanitizeTableName($form->name);
     $newTableName = $this->sanitizeTableName($request->name);
-
+    $oldRoleName = 'form_' . Str::slug($form->name, '_');
+    $newRoleName = 'form_' . Str::slug($request->name, '_');
 
     try {
+        DB::beginTransaction();
+
+        // Mettre à jour le formulaire
         $form->update([
             'name' => $request->name,
             'form_data' => json_encode($request->form_data),
             'description' => $request->description ?? null
         ]);
 
+        // Renommer les tables si nécessaire
         if ($oldTableName !== $newTableName) {
             Schema::rename($oldTableName, $newTableName);
             Schema::rename($oldTableName.'_multi_option', $newTableName.'_multi_option');
             Schema::rename($oldTableName.'_multi_value', $newTableName.'_multi_value');
         }
 
+        // Mettre à jour la structure de la table
         $this->updateDynamicTableStructure($newTableName, $request->form_data);
+
+        // Mettre à jour le rôle dans Keycloak si le nom a changé
+        if ($oldRoleName !== $newRoleName) {
+            $keycloak = new KeycloakController();
+            
+            // 1. Créer le nouveau rôle
+            if (!$keycloak->createRole($newRoleName, 'Role for form '.$request->name)) {
+                throw new \Exception('Failed to create new Keycloak role');
+            }
+            
+            // 2. Récupérer tous les utilisateurs ayant l'ancien rôle
+            $usersWithRole = $this->getUsersWithRole($oldRoleName);
+            
+            // 3. Assigner le nouveau rôle et révoquer l'ancien pour chaque utilisateur
+            foreach ($usersWithRole as $userId) {
+                if (!$keycloak->assignRoleToUser($userId, $newRoleName)) {
+                    throw new \Exception("Failed to assign new role to user $userId");
+                }
+                
+                if (!$keycloak->revokeRoleFromUser($userId, $oldRoleName)) {
+                    throw new \Exception("Failed to revoke old role from user $userId");
+                }
+            }
+            
+            // 4. Supprimer l'ancien rôle
+            if (!$keycloak->deleteRole($oldRoleName)) {
+                throw new \Exception('Failed to delete old Keycloak role');
+            }
+        }
 
         DB::commit();
 
@@ -258,6 +298,33 @@ EOD;
             'message' => 'Error updating form',
             'error' => $e->getMessage()
         ], 500);
+    }
+}
+private function getUsersWithRole($roleName)
+{
+    try {
+        $keycloak = new KeycloakController();
+        $token = $keycloak->getAdminToken();
+        $clientId = $keycloak->getClientId($token);
+
+
+        $url = config('services.keycloak.base_url').'/admin/realms/'.config('services.keycloak.realm').'/clients/'.$clientId.'/roles/'.$roleName.'/users';
+
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . $token,
+            'Content-Type' => 'application/json'
+        ])->get($url);
+
+        if ($response->successful()) {
+            $users = $response->json();
+            return array_column($users, 'id');
+        }
+
+        throw new \Exception('Failed to get users with role: '.$response->body());
+        
+    } catch (\Exception $e) {
+        \Log::error('Failed to get users with role: '.$e->getMessage());
+        return [];
     }
 }
 
@@ -329,15 +396,22 @@ public function handleFileUpload(Request $request)
         $name = Str::lower(Str::slug($name, '_'));
         return preg_match('/^[a-z][a-z0-9_]*$/', $name) ? $name : null;
     }
-private function createDynamicTable(string $tableName, array $fields)
+
+
+    private function sanitizeColumnName(string $name): string
     {
-        try {
+        return Str::lower(Str::slug($name, '_'));
+    }
+    
+    private function createDynamicTable(string $tableName, array $fields)
+{
+    try {
+        // Ne créer la table que si elle n'existe pas
+        if (!Schema::hasTable($tableName)) {
             Schema::create($tableName, function ($table) use ($fields, $tableName) {
                 $table->increments('id')->unsigned();
-                
-                // Ajout du champ user_id pour Keycloak
-                $table->string('user_id')->nullable()->index();
-                
+                $table->string('user_id')->nullable()->index(); // Pour Keycloak
+
                 foreach ($fields as $field) {
                     if (!isset($field['name']) || !isset($field['type'])) {
                         continue;
@@ -345,69 +419,72 @@ private function createDynamicTable(string $tableName, array $fields)
 
                     $columnName = $this->sanitizeColumnName($field['name']);
                     $type = $field['type'];
-                    
-                    if ($type === 'multiselect') 
-                       continue;
-                    
+
+                    if ($type === 'multiselect') continue;
+
                     $columnType = $this->mapFieldTypeToMySQL($type);
                     if ($columnType) {
                         $column = $table->{$columnType}($columnName)->nullable();
-                        if ($columnType === 'integer') $column->unsigned();
+                        if ($columnType === 'integer') {
+                            $column->unsigned();
+                        }
                     }
                 }
-                
+
                 $table->timestamps();
                 $table->engine = 'InnoDB';
             });
-
-            $hasMultiselect = collect($fields)->contains('type', 'multiselect');
-            if ($hasMultiselect) {
-                $this->createMultiSelectTables($tableName);
-            }
-
-        } catch (\Exception $e) {
-            \Log::error('Table creation error: '.$e->getMessage());
-            throw $e;
         }
-    }
 
-    private function sanitizeColumnName(string $name): string
-    {
-        return Str::lower(Str::slug($name, '_'));
+        // Créer les tables annexes uniquement si champ multiselect présent
+        $hasMultiselect = collect($fields)->contains('type', 'multiselect');
+        if ($hasMultiselect) {
+            $this->createMultiSelectTables($tableName);
+        }
+
+    } catch (\Exception $e) {
+        \Log::error('Table creation error: ' . $e->getMessage());
+        throw $e;
     }
-    
-    private function createMultiSelectTables(string $tableName)
-    {
-        Schema::create($tableName.'_multi_option', function ($table) {
+}
+
+private function createMultiSelectTables(string $tableName)
+{
+    $multiOptionTable = $tableName . '_multi_option';
+    $multiValueTable = $tableName . '_multi_value';
+
+    if (!Schema::hasTable($multiOptionTable)) {
+        Schema::create($multiOptionTable, function ($table) {
             $table->increments('id')->unsigned();
             $table->string('field_name', 255);
             $table->string('option_value', 255);
             $table->unique(['field_name', 'option_value']);
             $table->engine = 'InnoDB';
         });
+    }
 
-        Schema::create($tableName.'_multi_value', function ($table) use ($tableName) {
+    if (!Schema::hasTable($multiValueTable)) {
+        Schema::create($multiValueTable, function ($table) use ($tableName, $multiOptionTable) {
             $table->integer('entry_id')->unsigned();
             $table->integer('option_id')->unsigned();
             $table->string('field_name', 255);
-            
+
             $table->foreign('entry_id')
                   ->references('id')
                   ->on($tableName)
                   ->onDelete('cascade');
-                  
+
             $table->foreign('option_id')
                   ->references('id')
-                  ->on($tableName.'_multi_option')
+                  ->on($multiOptionTable)
                   ->onDelete('cascade');
-                  
+
             $table->primary(['entry_id', 'option_id', 'field_name']);
             $table->engine = 'InnoDB';
         });
     }
-    
-  
-    
+}
+
     private function mapFieldTypeToMySQL(string $fieldType): ?string
     {
         return match ($fieldType) {
@@ -607,7 +684,7 @@ public function saveFieldOptions(Request $request, $formId)
     }private function updateDynamicTableStructure(string $tableName, array $fields)
     {
         $existingColumns = Schema::getColumnListing($tableName);
-        $columnsToKeep = ['id', 'created_at', 'updated_at'];
+        $columnsToKeep = ['id', 'created_at', 'updated_at', 'user_id'];
         
         $hasMultiselect = false;
     
@@ -1028,6 +1105,22 @@ protected function processMediaFields(array &$entry, array $mediaFields, int $fo
             $fieldName = $field['name'];
             $fieldType = $field['type'];
             $inputValue = $request->input($fieldName);
+                // Handle date fields
+            if ($fieldType === 'date') {
+                if (!empty($inputValue)) {
+                    try {
+                        // Convert ISO 8601 to MySQL date format
+                        $date = new \DateTime($inputValue);
+                        $dataToInsert[$fieldName] = $date->format('Y-m-d');
+                    } catch (\Exception $e) {
+                        \Log::error("Invalid date format for field {$fieldName}: {$inputValue}");
+                        $dataToInsert[$fieldName] = null;
+                    }
+                } else {
+                    $dataToInsert[$fieldName] = null;
+                }
+                continue;
+            }
 
             // 3. Gestion des fichiers (partie corrigée)
             if ($fieldType === 'file' || $fieldType === 'image') {
@@ -1118,6 +1211,22 @@ protected function processMediaFields(array &$entry, array $mediaFields, int $fo
             'entry_id' => $entryId,
             'data' => $dataToInsert
         ];
+       // $notification = new RoleUpdatedNotification(
+   // "Vous avez soumis le formulaire : {$form->name}",
+  //  [],
+    //'formulaire_soumis'
+//);
+
+// Enregistrement manuel dans la table notifications
+//DB::table('notifications')->insert([
+   // 'id' => Str::uuid(),
+    //'type' => get_class($notification),
+    //'notifiable_type' => 'keycloak_user',
+   // 'notifiable_id' => $user['sub'], // ID Keycloak
+   // 'data' => json_encode($notification->toArray(null)),
+   // 'created_at' => now(),
+    //'updated_at' => now(),
+//]);
 
         // Ajout des URLs des fichiers
         foreach ($formData as $field) {
@@ -1381,7 +1490,7 @@ public function updateFormData(Request $request, $formId, $entryId)
         $formFields = json_decode($form->form_data, true);
         $dataToUpdate = [];
 
-        // 1. Mettre à jour les champs normaux
+        // 1. Update normal fields
         foreach ($formFields as $field) {
             $key = $field['name'];
             $type = $field['type'];
@@ -1397,11 +1506,27 @@ public function updateFormData(Request $request, $formId, $entryId)
             }
             
             if ($type === 'multiselect') {
-                continue; // géré séparément
+                continue; // handled separately
             }
 
             if ($request->has($key)) {
-                $dataToUpdate[$key] = $request->input($key);
+                // Handle date fields conversion
+                if ($type === 'date' || $type === 'datetime') {
+                    $inputValue = $request->input($key);
+                    if (!empty($inputValue)) {
+                        try {
+                            $date = new \DateTime($inputValue);
+                            $dataToUpdate[$key] = $type === 'date' 
+                                ? $date->format('Y-m-d') 
+                                : $date->format('Y-m-d H:i:s');
+                        } catch (\Exception $e) {
+                            \Log::error("Invalid date format for field {$key}: {$inputValue}");
+                            continue; // Skip this field update
+                        }
+                    }
+                } else {
+                    $dataToUpdate[$key] = $request->input($key);
+                }
             }
         }
 
@@ -1409,14 +1534,14 @@ public function updateFormData(Request $request, $formId, $entryId)
             DB::table($tableName)->where('id', $entryId)->update($dataToUpdate);
         }
 
-        // 2. Mettre à jour les multiselects seulement si la table existe
+        // 2. Update multiselects if table exists
         if (Schema::hasTable($multiSelectOptionsTable)) {
             foreach ($formFields as $field) {
                 if ($field['type'] === 'multiselect') {
                     $key = $field['name'];
                     $newValues = $request->input($key, []);
                     
-                    // Convertir en tableau si c'est une chaîne JSON
+                    // Convert from JSON string if needed
                     if (is_string($newValues)) {
                         try {
                             $newValues = json_decode($newValues, true);
@@ -1425,16 +1550,16 @@ public function updateFormData(Request $request, $formId, $entryId)
                         }
                     }
                     
-                    // S'assurer que c'est un tableau
+                    // Ensure it's an array
                     $newValues = is_array($newValues) ? $newValues : [];
 
-                    // Supprimer les anciennes valeurs
+                    // Delete old values
                     DB::table($multiSelectPivotTable)
                         ->where('entry_id', $entryId)
                         ->where('field_name', $key)
                         ->delete();
 
-                    // Ajouter les nouvelles valeurs
+                    // Add new values
                     foreach ($newValues as $value) {
                         $option = DB::table($multiSelectOptionsTable)
                             ->where('field_name', $key)
@@ -1461,11 +1586,14 @@ public function updateFormData(Request $request, $formId, $entryId)
         }
 
         DB::commit();
-        return response()->json(['message' => 'Données mises à jour avec succès']);
+        return response()->json(['message' => 'Data updated successfully']);
     } catch (\Exception $e) {
         DB::rollBack();
-        \Log::error('Erreur mise à jour données : ' . $e->getMessage());
-        return response()->json(['error' => 'Erreur mise à jour: ' . $e->getMessage()], 500);
+        \Log::error('Error updating data: ' . $e->getMessage());
+        return response()->json([
+            'error' => 'Error during update',
+            'message' => $e->getMessage()
+        ], 500);
     }
 }
     private function getOptionsFromTable($tableName, $fieldName)
@@ -1721,6 +1849,51 @@ public function getFormColumns($id)
     return response()->json($columns);
 }
 
+// FormController.php
+public function getTableOptions($table, Request $request)
+{
+    $request->validate([
+        'key_column' => 'required|string',
+        'value_column' => 'required|string',
+        'where' => 'nullable|string' // Clause WHERE optionnelle
+    ]);
+
+    try {
+        if (!Schema::hasTable($table)) {
+            return response()->json(['error' => 'Table not found'], 404);
+        }
+
+        $keyColumn = $request->key_column;
+        $valueColumn = $request->value_column;
+
+        if (!Schema::hasColumn($table, $keyColumn) || !Schema::hasColumn($table, $valueColumn)) {
+            return response()->json(['error' => 'Invalid columns'], 400);
+        }
+
+        $query = DB::table($table)
+            ->select([$keyColumn, $valueColumn])
+            ->distinct();
+
+        if ($request->where) {
+            $query->whereRaw($request->where);
+        }
+
+        $options = $query->get()
+            ->map(function ($item) use ($keyColumn, $valueColumn) {
+                return [
+                    'key' => $item->$keyColumn,
+                    'value' => $item->$valueColumn
+                ];
+            });
+
+        return response()->json($options);
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => 'Database error',
+            'message' => $e->getMessage()
+        ], 500);
+    }
+}
 
 
 

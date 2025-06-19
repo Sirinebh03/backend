@@ -4,9 +4,21 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\FormController;
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\KeycloakController;
+use App\Http\Controllers\CardController;
 
 Route::middleware(['api'] )->group(function () {
     
+// Dans routes/api.php
+        Route::get('/forms/table', [FormController::class, 'getAvailableTables']);
+        Route::get('/forms/options/{table}/{field}', [FormController::class, 'getFieldOptions']);
+        Route::get('/forms/tables/{table}/options', [FormController::class, 'getTableOptions']);
+
+
+      Route::get('/cards', [CardController::class, 'index']);
+    Route::post('/cards', [CardController::class, 'store']);
+    Route::put('/cards/{id}', [CardController::class, 'update']);
+Route::delete('/cards/{id}', [CardController::class, 'destroy']);
+
     // Routes publiques
     Route::prefix('forms')->group(function () {
         // Routes GET publiques
@@ -16,16 +28,14 @@ Route::middleware(['api'] )->group(function () {
         Route::get('/id-by-name/{name}', [FormController::class, 'getIdByName']);
         Route::get('/{id}/config', [FormController::class, 'getFormConfig']);
         Route::get('/{id}/metadata', [FormController::class, 'getFormMetadata']);
-        Route::get('/table', [FormController::class, 'getAvailableTables']);
         Route::get('/tables/{table}/fields', [FormController::class, 'getTableFields']);
         Route::get('/get-column-values/{table}/{column}', [FormController::class, 'getColumnValues']);
-        Route::get('/options/{table}/{field}', [FormController::class, 'getFieldOptions']);
         Route::get('/users/{formId}/{userId}', [FormController::class, 'getUserFormDetails']);
         // Routes POST publiques
         Route::post('/upload', [FormController::class, 'handleFileUpload']);
-        
+      
         // Routes fichiers publiques
-        Route::get('/{formId}/files/{filename}', [FormController::class, 'getFile'])->where('filename', '.*');
+    Route::get('/{formId}/files/{filename}', [FormController::class, 'getFile'])->where('filename', '.*');
      Route::get('/{id}/data', [FormController::class, 'getFormData']);
     });
 
